@@ -17,8 +17,15 @@ for pkg in \
     'api/services/introspection/v1/' \
     'api/services/containers/v1/' \
 ; do
+    name=$(basename $pkg)
+    if [[ "$name" == "v1" ]]; then
+        name=$(basename $(dirname $pkg))
+    fi
+
     protoc \
-        --doc_out="filemap=./docs/grpc-templates/filemap.xml:docs/grpc" \
+        --plugin=protoc-gen-doc=/go/bin/protoc-gen-doc \
+        --doc_out=./docs/grpc \
+        --doc_opt=html,$name.html \
         --proto_path=/go/src/ \
         --proto_path=./protobuf/ \
         --proto_path=./vendor/github.com/gogo/protobuf/ \
