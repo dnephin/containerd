@@ -137,9 +137,7 @@ func TestStartupDelay(t *testing.T) {
 			PauseThreshold: 0.001,
 			StartupDelay:   duration(time.Millisecond),
 		}
-		tc = &testCollector{
-			d: time.Second,
-		}
+		tc          = &testCollector{d: time.Second}
 		ctx, cancel = context.WithCancel(context.Background())
 		scheduler   = newScheduler(tc, cfg)
 	)

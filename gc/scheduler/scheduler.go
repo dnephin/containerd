@@ -9,6 +9,7 @@ import (
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/plugin"
+	"github.com/jonboulle/clockwork"
 	"github.com/pkg/errors"
 )
 
@@ -140,6 +141,7 @@ type gcScheduler struct {
 	mutationThreshold int
 	scheduleDelay     time.Duration
 	startupDelay      time.Duration
+	clock             clockwork.Clock
 }
 
 func newScheduler(c collector, cfg *config) *gcScheduler {
@@ -153,6 +155,7 @@ func newScheduler(c collector, cfg *config) *gcScheduler {
 		mutationThreshold: cfg.MutationThreshold,
 		scheduleDelay:     time.Duration(cfg.ScheduleDelay),
 		startupDelay:      time.Duration(cfg.StartupDelay),
+		clock:             clockwork.NewRealClock(),
 	}
 
 	if s.pauseThreshold < 0.0 {
@@ -187,9 +190,7 @@ func (s *gcScheduler) wait(ctx context.Context, trigger bool) (gc.Stats, error) 
 	s.waiterL.Unlock()
 
 	if trigger {
-		e := mutationEvent{
-			ts: time.Now(),
-		}
+		e := mutationEvent{ts: s.clock.Now()}
 		go func() {
 			s.eventC <- e
 		}()
@@ -211,7 +212,7 @@ func (s *gcScheduler) wait(ctx context.Context, trigger bool) (gc.Stats, error) 
 
 func (s *gcScheduler) mutationCallback(dirty bool) {
 	e := mutationEvent{
-		ts:       time.Now(),
+		ts:       s.clock.Now(),
 		mutation: true,
 		dirty:    dirty,
 	}
@@ -220,9 +221,9 @@ func (s *gcScheduler) mutationCallback(dirty bool) {
 	}()
 }
 
-func schedule(d time.Duration) (<-chan time.Time, *time.Time) {
-	next := time.Now().Add(d)
-	return time.After(d), &next
+func schedule(clock clockwork.Clock, d time.Duration) (<-chan time.Time, *time.Time) {
+	next := clock.Now().Add(d)
+	return clock.After(d), &next
 }
 
 func (s *gcScheduler) run(ctx context.Context) {
@@ -241,8 +242,9 @@ func (s *gcScheduler) run(ctx context.Context) {
 		deletions int
 		mutations int
 	)
+
 	if s.startupDelay > 0 {
-		schedC, nextCollection = schedule(s.startupDelay)
+		schedC, nextCollection = schedule(s.clock, s.startupDelay)
 	}
 	for {
 		select {
@@ -252,7 +254,7 @@ func (s *gcScheduler) run(ctx context.Context) {
 			// it to attempt again after another time interval.
 			if !triggered && lastCollection != nil && deletions == 0 &&
 				(s.mutationThreshold == 0 || mutations < s.mutationThreshold) {
-				schedC, nextCollection = schedule(interval)
+				schedC, nextCollection = schedule(s.clock, interval)
 				continue
 			}
 		case e := <-s.eventC:
@@ -274,9 +276,9 @@ func (s *gcScheduler) run(ctx context.Context) {
 				(nextCollection == nil && ((s.deletionThreshold == 0 && deletions > 0) ||
 					(s.mutationThreshold > 0 && mutations >= s.mutationThreshold))) {
 				// Check if not already scheduled before delay threshold
-				if nextCollection == nil || nextCollection.After(time.Now().Add(s.scheduleDelay)) {
+				if nextCollection == nil || nextCollection.After(s.clock.Now().Add(s.scheduleDelay)) {
 					// TODO(dmcg): track re-schedules for tuning schedule config
-					schedC, nextCollection = schedule(s.scheduleDelay)
+					schedC, nextCollection = schedule(s.clock, s.scheduleDelay)
 				}
 			}
 
@@ -288,14 +290,14 @@ func (s *gcScheduler) run(ctx context.Context) {
 		s.waiterL.Lock()
 
 		stats, err := s.c.GarbageCollect(ctx)
-		last := time.Now()
+		last := s.clock.Now()
 		if err != nil {
 			log.G(ctx).WithError(err).Error("garbage collection failed")
 
 			// Reschedule garbage collection for same duration + 1 second
-			schedC, nextCollection = schedule(nextCollection.Sub(*lastCollection) + time.Second)
+			schedC, nextCollection = schedule(s.clock, nextCollection.Sub(*lastCollection)+time.Second)
 
-			// Update last collection time even though failure occured
+			// Update last collection time even though failure occurred
 			lastCollection = &last
 
 			for _, w := range s.waiters {
@@ -325,7 +327,7 @@ func (s *gcScheduler) run(ctx context.Context) {
 		}
 
 		lastCollection = &last
-		schedC, nextCollection = schedule(interval)
+		schedC, nextCollection = schedule(s.clock, interval)
 
 		for _, w := range s.waiters {
 			w <- stats
