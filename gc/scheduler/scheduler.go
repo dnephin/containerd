@@ -69,11 +69,8 @@ type duration time.Duration
 
 func (d *duration) UnmarshalText(text []byte) error {
 	ed, err := time.ParseDuration(string(text))
-	if err != nil {
-		return err
-	}
 	*d = duration(ed)
-	return nil
+	return err
 }
 
 func init() {

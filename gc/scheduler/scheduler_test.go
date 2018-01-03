@@ -10,6 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDurationUnmarshalText(t *testing.T) {
+	var d duration
+	require.NoError(t, d.UnmarshalText([]byte("3s")))
+	require.Equal(t, duration(3*time.Second), d)
+
+	require.EqualError(t, d.UnmarshalText([]byte("bogus")), "time: invalid duration bogus")
+	require.EqualError(t, d.UnmarshalText([]byte{}), "time: invalid duration ")
+}
+
 func TestPauseThreshold(t *testing.T) {
 	cfg := &config{
 		// With 100μs, gc should run about every 5ms
@@ -152,9 +161,10 @@ func TestStartupDelay(t *testing.T) {
 }
 
 type testCollector struct {
-	d  time.Duration
-	gc int
-	m  sync.Mutex
+	d       time.Duration
+	gcError error
+	gc      int
+	m       sync.Mutex
 
 	callbacks []func(bool)
 }
@@ -180,7 +190,7 @@ func (tc *testCollector) GarbageCollect(context.Context) (gc.Stats, error) {
 	tc.m.Lock()
 	tc.gc++
 	tc.m.Unlock()
-	return gcStats{elapsed: tc.d}, nil
+	return gcStats{elapsed: tc.d}, tc.gcError
 }
 
 type gcStats struct {
