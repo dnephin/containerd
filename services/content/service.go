@@ -266,12 +266,8 @@ func (s *service) ListStatuses(ctx context.Context, req *api.ListStatusesRequest
 
 func (s *service) Write(session api.Content_WriteServer) (err error) {
 	var (
-		ctx      = session.Context()
-		msg      api.WriteContentResponse
-		req      *api.WriteContentRequest
-		ref      string
-		total    int64
-		expected digest.Digest
+		ctx = session.Context()
+		msg api.WriteContentResponse
 	)
 
 	defer func(msg *api.WriteContentResponse) {
@@ -294,155 +290,198 @@ func (s *service) Write(session api.Content_WriteServer) (err error) {
 	}(&msg)
 
 	// handle the very first request!
-	req, err = session.Recv()
+	req, err := session.Recv()
 	if err != nil {
 		return err
 	}
-
-	ref = req.Ref
-
-	if ref == "" {
+	if req.Ref == "" {
 		return status.Errorf(codes.InvalidArgument, "first message must have a reference")
 	}
 
-	fields := logrus.Fields{
-		"ref": ref,
-	}
-	total = req.Total
-	expected = req.Expected
-	if total > 0 {
-		fields["total"] = total
-	}
-
-	if expected != "" {
-		fields["expected"] = expected
-	}
-
-	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(fields))
-
+	ctx = contextForWriteRequest(ctx, req)
 	log.G(ctx).Debug("(*service).Write started")
 	// this action locks the writer for the session.
-	wr, err := s.store.Writer(ctx, ref, total, expected)
+	wr, err := s.store.Writer(ctx, req.Ref, req.Total, req.Expected)
 	if err != nil {
 		return errdefs.ToGRPC(err)
 	}
 	defer wr.Close()
 
+	blobExistsInStore := func(blob digest.Digest) error {
+		if blob == "" {
+			return nil
+		}
+		if _, err := s.store.Info(session.Context(), blob); err != nil {
+			return nil
+		}
+		if err := s.store.Abort(session.Context(), req.Ref); err != nil {
+			log.G(ctx).WithError(err).Error("failed to abort write")
+		}
+		return status.Errorf(codes.AlreadyExists, "blob with expected digest %v exists", req.Expected)
+	}
+
+	progress := &progress{}
 	for {
-		msg.Action = req.Action
-		ws, err := wr.Status()
+		if err := progress.updateReq(req); err != nil {
+			return err
+		}
+		if err := blobExistsInStore(req.Expected); err != nil {
+			return err
+		}
+
+		msg, err = handleWriteRequestAction(wr, *progress)
 		if err != nil {
-			return errdefs.ToGRPC(err)
+			return err
 		}
 
-		msg.Offset = ws.Offset // always set the offset.
-
-		// NOTE(stevvooe): In general, there are two cases underwhich a remote
-		// writer is used.
-		//
-		// For pull, we almost always have this before fetching large content,
-		// through descriptors. We allow predeclaration of the expected size
-		// and digest.
-		//
-		// For push, it is more complex. If we want to cut through content into
-		// storage, we may have no expectation until we are done processing the
-		// content. The case here is the following:
-		//
-		// 	1. Start writing content.
-		// 	2. Compress inline.
-		// 	3. Validate digest and size (maybe).
-		//
-		// Supporting these two paths is quite awkward but it lets both API
-		// users use the same writer style for each with a minimum of overhead.
-		if req.Expected != "" {
-			if expected != "" && expected != req.Expected {
-				return status.Errorf(codes.InvalidArgument, "inconsistent digest provided: %v != %v", req.Expected, expected)
-			}
-			expected = req.Expected
-
-			if _, err := s.store.Info(session.Context(), req.Expected); err == nil {
-				if err := s.store.Abort(session.Context(), ref); err != nil {
-					log.G(ctx).WithError(err).Error("failed to abort write")
-				}
-
-				return status.Errorf(codes.AlreadyExists, "blob with expected digest %v exists", req.Expected)
+		if req.Action == api.WriteActionCommit {
+			if err := commit(ctx, wr, *progress); err != nil {
+				return err
 			}
 		}
 
-		if req.Total > 0 {
-			// Update the expected total. Typically, this could be seen at
-			// negotiation time or on a commit message.
-			if total > 0 && req.Total != total {
-				return status.Errorf(codes.InvalidArgument, "inconsistent total provided: %v != %v", req.Total, total)
-			}
-			total = req.Total
-		}
-
-		switch req.Action {
-		case api.WriteActionStat:
-			msg.Digest = wr.Digest()
-			msg.StartedAt = ws.StartedAt
-			msg.UpdatedAt = ws.UpdatedAt
-			msg.Total = total
-		case api.WriteActionWrite, api.WriteActionCommit:
-			if req.Offset > 0 {
-				// validate the offset if provided
-				if req.Offset != ws.Offset {
-					return status.Errorf(codes.OutOfRange, "write @%v must occur at current offset %v", req.Offset, ws.Offset)
-				}
-			}
-
-			if req.Offset == 0 && ws.Offset > 0 {
-				if err := wr.Truncate(req.Offset); err != nil {
-					return errors.Wrapf(err, "truncate failed")
-				}
-				msg.Offset = req.Offset
-			}
-
-			// issue the write if we actually have data.
-			if len(req.Data) > 0 {
-				// While this looks like we could use io.WriterAt here, because we
-				// maintain the offset as append only, we just issue the write.
-				n, err := wr.Write(req.Data)
-				if err != nil {
-					return err
-				}
-
-				if n != len(req.Data) {
-					// TODO(stevvooe): Perhaps, we can recover this by including it
-					// in the offset on the write return.
-					return status.Errorf(codes.DataLoss, "wrote %v of %v bytes", n, len(req.Data))
-				}
-
-				msg.Offset += int64(n)
-			}
-
-			if req.Action == api.WriteActionCommit {
-				var opts []content.Opt
-				if req.Labels != nil {
-					opts = append(opts, content.WithLabels(req.Labels))
-				}
-				if err := wr.Commit(ctx, total, expected, opts...); err != nil {
-					return err
-				}
-			}
-
-			msg.Digest = wr.Digest()
-		}
-
+		msg.Digest = wr.Digest()
 		if err := session.Send(&msg); err != nil {
 			return err
 		}
 
 		req, err = session.Recv()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-
+		switch {
+		case err == io.EOF:
+			return nil
+		case err != nil:
 			return err
 		}
 	}
+}
+
+func contextForWriteRequest(ctx context.Context, req *api.WriteContentRequest) context.Context {
+	fields := logrus.Fields{"ref": req.Ref}
+
+	if total := req.Total; total > 0 {
+		fields["total"] = total
+	}
+	if expected := req.Expected; expected != "" {
+		fields["expected"] = expected
+	}
+
+	return log.WithLogger(ctx, log.G(ctx).WithFields(fields))
+}
+
+type progress struct {
+	total       int64
+	expected    digest.Digest
+	lastRequest *api.WriteContentRequest
+}
+
+func (p *progress) updateReq(req *api.WriteContentRequest) error {
+	p.lastRequest = req
+	if err := p.validateExpected(req.Expected); err != nil {
+		return err
+	}
+	return p.updateTotal(req.Total)
+}
+
+func (p *progress) validateExpected(reqExpected digest.Digest) error {
+	// NOTE(stevvooe): In general, there are two cases underwhich a remote
+	// writer is used.
+	//
+	// For pull, we almost always have this before fetching large content,
+	// through descriptors. We allow predeclaration of the expected size
+	// and digest.
+	//
+	// For push, it is more complex. If we want to cut through content into
+	// storage, we may have no expectation until we are done processing the
+	// content. The case here is the following:
+	//
+	// 	1. Start writing content.
+	// 	2. Compress inline.
+	// 	3. Validate digest and size (maybe).
+	//
+	// Supporting these two paths is quite awkward but it lets both API
+	// users use the same writer style for each with a minimum of overhead.
+	if reqExpected == "" {
+		return nil
+	}
+	if p.expected != "" && p.expected != reqExpected {
+		return status.Errorf(codes.InvalidArgument, "inconsistent digest provided: %v != %v", reqExpected, p.expected)
+	}
+	p.expected = reqExpected
+	return nil
+}
+
+func (p *progress) updateTotal(reqTotal int64) error {
+	if reqTotal > 0 {
+		// Update the expected total. Typically, this could be seen at
+		// negotiation time or on a commit message.
+		if p.total > 0 && reqTotal != p.total {
+			return status.Errorf(codes.InvalidArgument, "inconsistent total provided: %v != %v", reqTotal, p.total)
+		}
+		p.total = reqTotal
+	}
+	return nil
+}
+
+func handleWriteRequestAction(wr content.Writer, progress progress) (api.WriteContentResponse, error) {
+	req := progress.lastRequest
+	ws, err := wr.Status()
+	if err != nil {
+		return api.WriteContentResponse{}, errdefs.ToGRPC(err)
+	}
+
+	msg := api.WriteContentResponse{
+		Action: req.Action,
+		Offset: ws.Offset, // always set the offset.
+	}
+
+	switch req.Action {
+	case api.WriteActionStat:
+		msg.StartedAt = ws.StartedAt
+		msg.UpdatedAt = ws.UpdatedAt
+		msg.Total = progress.total
+
+	case api.WriteActionWrite, api.WriteActionCommit:
+		if req.Offset > 0 {
+			// validate the offset if provided
+			if req.Offset != ws.Offset {
+				return msg, status.Errorf(codes.OutOfRange, "write @%v must occur at current offset %v", req.Offset, ws.Offset)
+			}
+		}
+
+		if req.Offset == 0 && ws.Offset > 0 {
+			if err := wr.Truncate(req.Offset); err != nil {
+				return msg, errors.Wrapf(err, "truncate failed")
+			}
+			msg.Offset = req.Offset
+		}
+
+		// issue the write if we actually have data.
+		if len(req.Data) > 0 {
+			// While this looks like we could use io.WriterAt here, because we
+			// maintain the offset as append only, we just issue the write.
+			n, err := wr.Write(req.Data)
+			if err != nil {
+				return msg, err
+			}
+
+			if n != len(req.Data) {
+				// TODO(stevvooe): Perhaps, we can recover this by including it
+				// in the offset on the write return.
+				return msg, status.Errorf(codes.DataLoss, "wrote %v of %v bytes", n, len(req.Data))
+			}
+
+			msg.Offset += int64(n)
+		}
+	}
+	return msg, nil
+}
+
+func commit(ctx context.Context, wr content.Writer, progress progress) error {
+	var opts []content.Opt
+	if progress.lastRequest.Labels != nil {
+		opts = append(opts, content.WithLabels(progress.lastRequest.Labels))
+	}
+	return wr.Commit(ctx, progress.total, progress.expected, opts...)
 }
 
 func (s *service) Abort(ctx context.Context, req *api.AbortRequest) (*ptypes.Empty, error) {
