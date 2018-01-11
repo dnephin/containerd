@@ -25,7 +25,6 @@ func newInode(stat *syscall.Stat_t) inode {
 }
 
 func diskUsage(roots ...string) (Usage, error) {
-
 	var (
 		size   int64
 		inodes = map[inode]struct{}{} // expensive!
