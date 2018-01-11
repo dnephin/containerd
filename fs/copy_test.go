@@ -5,10 +5,10 @@ import (
 	"os"
 	"testing"
 
-	_ "crypto/sha256"
-
 	"github.com/containerd/containerd/fs/fstest"
+	"github.com/gotestyourself/gotestyourself/fs"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 // TODO: Create copy directory which requires privilege
@@ -69,3 +69,64 @@ func testCopy(apply fstest.Applier) error {
 
 	return fstest.CheckDirectoryEqual(t1, t2)
 }
+
+func TestCopyDirErrors(t *testing.T) {
+	defaultPath := func() fs.Path {
+		return fs.NewDir(t, "test-copy-dir-default")
+	}
+
+	var testcases = []struct {
+		name     string
+		src      fs.Path
+		dst      fs.Path
+		expected string
+	}{
+		{
+			name:     "missing source dir",
+			src:      nonExistantPath{path: "/does/not/exist"},
+			dst:      defaultPath(),
+			expected: "failed to stat source: stat /does/not/exist: no such file or directory",
+		},
+		{
+			name:     "source is a file",
+			src:      fs.NewFile(t, "test-copy-dir-src-file"),
+			dst:      defaultPath(),
+			expected: "source is not a directory",
+		},
+		{
+			name:     "dest can't be created",
+			src:      defaultPath(),
+			dst:      nonExistantPath{path: "/bad/dest"},
+			expected: "failed to make destination: mkdir /bad/dest",
+		},
+		{
+			name:     "dest is a file",
+			src:      defaultPath(),
+			dst:      fs.NewFile(t, "test-copy-dir-dest-file"),
+			expected: "cannot copy to non-directory",
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			defer testcase.src.Remove()
+			defer testcase.dst.Remove()
+
+			err := CopyDir(testcase.dst.Path(), testcase.src.Path())
+			require.Error(t, err)
+			require.Contains(t, err.Error(), testcase.expected)
+		})
+	}
+}
+
+type nonExistantPath struct {
+	path string
+}
+
+func (n nonExistantPath) Path() string {
+	return n.path
+}
+
+func (n nonExistantPath) Remove() {}
+
+var _ fs.Path = nonExistantPath{}

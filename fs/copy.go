@@ -26,15 +26,15 @@ func CopyDir(dst, src string) error {
 func copyDirectory(dst, src string, inodes map[uint64]string) error {
 	stat, err := os.Stat(src)
 	if err != nil {
-		return errors.Wrapf(err, "failed to stat %s", src)
+		return errors.Wrap(err, "failed to stat source")
 	}
 	if !stat.IsDir() {
-		return errors.Errorf("source is not directory")
+		return errors.New("source is not a directory")
 	}
 
 	if st, err := os.Stat(dst); err != nil {
 		if err := os.Mkdir(dst, stat.Mode()); err != nil {
-			return errors.Wrapf(err, "failed to mkdir %s", dst)
+			return errors.Wrap(err, "failed to make destination")
 		}
 	} else if !st.IsDir() {
 		return errors.Errorf("cannot copy to non-directory: %s", dst)
