@@ -58,14 +58,14 @@ type Change struct {
 // computed during a directory changes calculation.
 type ChangeFunc func(ChangeKind, string, os.FileInfo, error) error
 
-// Changes computes changes between two directories calling the
-// given change function for each computed change. The first
-// directory is intended to the base directory and second
-// directory the changed directory.
+// Changes compares two directories and calls the change function each time
+// it finds a difference between the directory trees. The first directory is
+// the base directory, and all change are relative to the base.
 //
-// The change callback is called by the order of path names and
-// should be appliable in that order.
-//  Due to this apply ordering, the following is true
+// The directories are compared in file path order, and the change function is
+// called in the same order.
+//
+// Due to this ordering, the following is true:
 //  - Removed directory trees only create a single change for the root
 //    directory removed. Remaining changes are implied.
 //  - A directory which is modified to become a file will not have
@@ -77,25 +77,26 @@ type ChangeFunc func(ChangeKind, string, os.FileInfo, error) error
 //
 // File content comparisons will be done on files which have timestamps
 // which may have been truncated. If either of the files being compared
-// has a zero value nanosecond value, each byte will be compared for
-// differences. If 2 files have the same seconds value but different
+// has a zero nanosecond value, the contents of each file will be
+// compared instead. If 2 files have the same seconds value but different
 // nanosecond values where one of those values is zero, the files will
 // be considered unchanged if the content is the same. This behavior
 // is to account for timestamp truncation during archiving.
 func Changes(ctx context.Context, a, b string, changeFn ChangeFunc) error {
 	if a == "" {
 		logrus.Debugf("Using single walk diff for %s", b)
-		return addDirChanges(ctx, changeFn, b)
-	} else if diffOptions := detectDirDiff(b, a); diffOptions != nil {
+		return addDirChanges(changeFn, b)
+	}
+	if diffOptions := detectDirDiff(b, a); diffOptions != nil {
 		logrus.Debugf("Using single walk diff for %s from %s", diffOptions.diffDir, a)
-		return diffDirChanges(ctx, changeFn, a, diffOptions)
+		return diffDirChanges(changeFn, a, diffOptions)
 	}
 
 	logrus.Debugf("Using double walk diff for %s from %s", b, a)
 	return doubleWalkDiff(ctx, changeFn, a, b)
 }
 
-func addDirChanges(ctx context.Context, changeFn ChangeFunc, root string) error {
+func addDirChanges(changeFn ChangeFunc, root string) error {
 	return filepath.Walk(root, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -127,7 +128,7 @@ type diffDirOptions struct {
 }
 
 // diffDirChanges walks the diff directory and compares changes against the base.
-func diffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *diffDirOptions) error {
+func diffDirChanges(changeFn ChangeFunc, base string, o *diffDirOptions) error {
 	changedDirs := make(map[string]struct{})
 	return filepath.Walk(o.diffDir, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
